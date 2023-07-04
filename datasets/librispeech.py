@@ -1,4 +1,5 @@
 import json
+import os
 import pathlib
 import numpy as np
 import librosa
@@ -64,7 +65,7 @@ def load_wav(file):
   sample = soundfile.read(file)[0].astype(np.float32)
   return sample, sample.shape[0]
 
-def iterate(bs=1, start=0):
+def iterate(bs=1, start=0, val=False):
   print(f"there are {len(ci)} samples in the dataset")
   for i in range(start, len(ci), bs):
     samples, sample_lens = zip(*[load_wav(BASEDIR / v["files"][0]["fname"]) for v in ci[i : i + bs]])
@@ -74,9 +75,15 @@ def iterate(bs=1, start=0):
     for j in range(len(samples)):
       samples[j] = np.pad(samples[j], (0, max_len - sample_lens[j]), "constant")
     samples, sample_lens = np.array(samples), np.array(sample_lens)
-
-    yield feature_extract(samples, sample_lens), np.array([v["transcript"] for v in ci[i : i + bs]])
+    if val:
+      yield feature_extract(samples, sample_lens), np.array([v["transcript"] for v in ci[i : i + bs]])
+    else:
+      LABELS = [" ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "'"]
+      transcript_labels = [[LABELS.index(c) for c in v["transcript"]] for v in ci[i: i + bs]]
+      yield feature_extract(samples, sample_lens), transcript_labels, np.array([v["transcript"] for v in ci[i : i + bs]])
 
 if __name__ == "__main__":
+  print(soundfile.__version__)
+  print(soundfile.__libsndfile_version__)
   X, Y = next(iterate())
   print(X[0].shape, Y.shape)
