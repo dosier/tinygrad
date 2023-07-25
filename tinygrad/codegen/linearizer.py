@@ -1,7 +1,8 @@
 from typing import List, Tuple, Any, Optional, cast, DefaultDict, NamedTuple, TypeVar, Dict, Iterator, Union, Sequence
 import itertools, math
 from collections import defaultdict
-from enum import Enum, auto
+from fastenum import Enum
+from enum import auto
 
 from tinygrad.helpers import dedup, colored, ImageDType, DEBUG, prod, dtypes, mnum, DType, all_same, partition
 from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, UnaryOps
@@ -617,7 +618,7 @@ class Linearizer:
           stride[j] = bst
           bst *= shp[j]
 
-    self.sts.append(ShapeTracker(tuple(shp), [View(tuple(shp), tuple(stride))]))
+    self.sts.append(ShapeTracker(tuple(shp), [View.create(tuple(shp), tuple(stride))]))
     self.bufs.append(LocalBuffer(name=f"ldata{i}", size=self.sts[-1].size()))
     if DEBUG >= 4: print("aliasing buffer", self.sts[i])
     self.local_alias[i] = self.bufs[-1]

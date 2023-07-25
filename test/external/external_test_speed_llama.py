@@ -29,7 +29,7 @@ class TestLLaMASpeed(unittest.TestCase):
       #print(f"clearing {len(Device['fake'].method_cache)} from method cache")
       if empty_method_cache: Device['fake'].method_cache.clear()
       tms = [time.perf_counter()]
-      for i in range(10):
+      for i in range(40):
         model(Tensor([[2]]), i).realize()
         tms.append(time.perf_counter())
       timings = [(tms[i+1]-tms[i])*1000 for i in range(len(tms)-1)]

@@ -2,7 +2,8 @@
 import unittest
 import numpy as np
 from tinygrad.helpers import prod, DEBUG
-from tinygrad.shape.shapetracker import ShapeTracker, View, get_contraction
+from tinygrad.shape.shapetracker import ShapeTracker, get_contraction, View
+
 
 def shapetracker_getitem(st, val):
   locals = {"idx": val, "valid": 1}

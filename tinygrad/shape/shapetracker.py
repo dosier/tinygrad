@@ -1,8 +1,9 @@
 # ShapeTracker allows movement operations to a buffer that don't require a copy to be made.
 from __future__ import annotations
-from enum import Enum, auto
+from fastenum import Enum
+from enum import auto
 import functools
-from typing import Dict, Tuple, Union, List, Optional, Callable, cast, NamedTuple
+from typing import Dict, Tuple, Union, List, Optional, Callable, cast
 from tinygrad.helpers import prod, DEBUG
 from tinygrad.shape.symbolic import Variable, MulNode, NumNode, Node, SumNode, is_sym_int
 
@@ -27,7 +28,24 @@ def is_contiguous(shape:Tuple[int, ...], strides:Tuple[int, ...]) -> bool: retur
 def filter_strides(shape:Tuple[int, ...], strides:Tuple[int, ...]) -> Tuple[int, ...]:
   return tuple(stride if shp != 1 else 0 for stride, shp in zip(strides, shape))
 
-class ViewInternal(NamedTuple):
+@functools.lru_cache(maxsize=None)
+def idxs_to_idx(shape:Tuple[int, ...], idxs) -> Node:
+  assert len(idxs) == len(shape), "need an idx for all dimensions"
+  acc = 1
+  ret = []
+  for tidx,d in reversed(list(zip(idxs, shape))):
+    ret.append(tidx * acc)
+    acc *= d
+  return Variable.sum(ret)
+
+@functools.lru_cache(maxsize=None)
+def strides_for_shape(shape:Tuple[int, ...]) -> Tuple[int, ...]:
+  strides = [1] if shape else []
+  for d in shape[::-1][:-1]: strides = [d*strides[0]] + strides
+  return tuple([st if s != 1 else 0 for st, s in zip(strides, shape)])
+
+class View(object):
+  __slots__ = 'shape', 'strides', 'offset', 'mask', 'contiguous', 'shape_strides'
   shape:Tuple[int, ...]
   strides:Tuple[int, ...]
   offset:int
@@ -35,14 +53,8 @@ class ViewInternal(NamedTuple):
   contiguous:bool
   shape_strides:Tuple[Tuple[int, int], ...]
 
-@functools.lru_cache(maxsize=None)
-class View(ViewInternal):
-  def __new__(cls, shape, strides=None, offset=0, mask=None):
-    strides_from_shape = strides_for_shape(shape)
-    strides = strides_from_shape if not strides else filter_strides(shape, strides)
-    contiguous = offset == 0 and is_contiguous(shape, strides) and mask is None
-    return super().__new__(cls, shape, strides, offset, mask, contiguous, to_shape_strides(shape, strides))
-  def __init__(self, shape, strides=None, offset=0, mask=None, contiguous=False, shape_strides=()): super().__init__()
+  def __init__(self, shape, strides=None, offset=0, mask=None, contiguous=False, shape_strides=()):
+    self.shape, self.strides, self.offset, self.mask, self.contiguous, self.shape_strides = shape,  strides, offset, mask, contiguous, shape_strides
 
   def expr_node_mask(self, idx, valid=None) -> Node:
     expr = [valid] if valid is not None else []
@@ -69,34 +81,77 @@ class View(ViewInternal):
     assert len(idxs) == len(self.shape), f"need an idx for all dimensions {idxs} vs {self.shape}"
     return Variable.sum([Variable.num(self.offset)] + [idx*st for idx,sh,st in zip(idxs, self.shape, self.strides) if sh != 1 and st != 0])
 
-@functools.lru_cache(maxsize=None)
-def idxs_to_idx(shape:Tuple[int, ...], idxs) -> Node:
-  assert len(idxs) == len(shape), "need an idx for all dimensions"
-  acc = 1
-  ret = []
-  for tidx,d in reversed(list(zip(idxs, shape))):
-    ret.append(tidx * acc)
-    acc *= d
-  return Variable.sum(ret)
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def create(shape, strides=None, offset=0, mask=None) -> View:
+    strides = strides_for_shape(shape) if not strides else filter_strides(shape, strides)
+    contiguous = offset == 0 and is_contiguous(shape, strides) and mask is None
+    return View(shape, strides, offset, mask, contiguous, to_shape_strides(shape, strides))
 
-@functools.lru_cache(maxsize=None)
-def strides_for_shape(shape:Tuple[int, ...]) -> Tuple[int, ...]:
-  strides = [1] if shape else []
-  for d in shape[::-1][:-1]: strides = [d*strides[0]] + strides
-  return tuple([st if s != 1 else 0 for st, s in zip(strides, shape)])
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def unsafe_resize(view, arg: Tuple[Tuple[int, int], ...], mask=None) -> View:
+    offset = get_unsafe_resize_offset(view.strides, arg)
+    if view.mask:
+      # move the old mask
+      nmask = tuple([(max(mx-ax, 0), min(my-ax, ay-ax)) for (mx,my),(ax,ay) in zip(view.mask, arg)])
+      # merge the masks if we have two
+      mask = tuple([(max(mx1, mx2), min(my1, my2)) for (mx1, my1), (mx2, my2) in zip(nmask, mask)]) if mask is not None else nmask
+    return View.create(tuple([y - x for x,y in arg]), view.strides, view.offset + offset, mask)
+
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def pad(view, arg: Tuple[Tuple[int, int], ...]) -> View:
+    assert all((b>=0 and e>=0) for b,e in arg) and len(arg) == len(view.shape)
+    if any(b or e for b, e in arg):
+      zvarg, mask = get_pad_args(view.shape, arg)
+      return View.unsafe_resize(view, zvarg, mask=mask)
+    return view
+
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def shrink(view, arg: Tuple[Tuple[int, int], ...]) -> View:
+    assert all((b>=0 and e<=s) for s,(b,e) in zip(view.shape,arg)) and len(arg) == len(view.shape)
+    return View.unsafe_resize(view, arg)
+
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def expand(view, new_shape: Tuple[int, ...]) -> View:
+    assert len(new_shape) == len(view.shape)
+    assert all(isinstance(x, int) and (s == x or (s == 1 and st == 0)) for s,x,st in zip(view.shape, new_shape, view.strides)), f"can't expand {view.shape} into {new_shape}"
+    # NOTE: can the mask ever be (0,0)?
+    mask = tuple([(((0,0) if m != (0,1) else (0,ns)) if s != ns else m) for m,s,ns in zip(view.mask, view.shape, new_shape)]) if view.mask else None
+    return View.create(new_shape, view.strides, view.offset, mask)
+
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def permute(view, axis: Tuple[int, ...]) -> View:
+    assert all(isinstance(x, int) and x >= 0 and x < len(view.shape) for x in axis), f"invalid permute {axis} for {view.shape}"
+    assert len(set(axis)) == len(axis) and len(axis) == len(view.shape), f"can't permute {view.shape} with {axis}"
+    return View.create(tuple([view.shape[a] for a in axis]), tuple([view.strides[a] for a in axis]), view.offset, tuple([view.mask[a] for a in axis]) if view.mask is not None else None)
+
+  @staticmethod
+  @functools.lru_cache(maxsize=None)
+  def stride(view, mul: Tuple[int, ...]) -> View:
+    assert all(isinstance(x, int) and x != 0 for x in mul), f"invalid stride {mul} for {view.shape}"
+    strides = tuple([z*m for z,m in zip(view.strides, mul)])
+    new_shape = tuple([(s+(abs(m)-1))//abs(m) for s,m in zip(view.shape, mul)])
+    offset = sum([(s-1)*z for s,z,m in zip(view.shape, view.strides, mul) if m < 0])
+    mask = tuple([(((mx if m > 0 else s-my)+(abs(m)-1))//abs(m), ((my if m > 0 else s-mx)+(abs(m)-1))//abs(m)) for (mx,my),s,m in zip(view.mask, view.shape, mul)]) if view.mask is not None else None
+    return View.create(new_shape, strides, view.offset + offset, mask)
 
 @functools.lru_cache(maxsize=None)
 def view_from_shape(shape:Tuple[Union[Node, int], ...]) -> View:
   assert all(is_sym_int(x) for x in shape)
-  return View(tuple(shape), strides_for_shape(shape))
+  return View.create(tuple(shape), strides_for_shape(shape))
 
 @functools.lru_cache(maxsize=None)
-def merge_views(vm2:View, vm1:View) -> Optional[View]:
+def merge_views(vm2: View, vm1: View) -> Optional[View]:
   if vm2.mask: return None  # this isn't supported yet
   mst = ShapeTracker(vm1.shape, [vm2, vm1])
   strides = mst.real_strides()
   if None in strides: return None
-  return View(vm1.shape, strides, mst.real_offset(), vm1.mask)
+  return View.create(vm1.shape, strides, mst.real_offset(), vm1.mask)
 
 @functools.lru_cache(maxsize=None)
 def _reshape(view: View, new_shape:Tuple[int, ...]) -> Tuple[View, bool]:
@@ -115,9 +170,9 @@ def _reshape(view: View, new_shape:Tuple[int, ...]) -> Tuple[View, bool]:
       else:
         new_mask: List[Tuple[int, int]] = [y for x,y in zip(shape, mask) if x != 1]
         new_mask_tuple = tuple([(0,1) if x == 1 else new_mask.pop(0) for x in new_shape])
-    return View(new_shape, new_strides_tuple, offset, new_mask_tuple), False
+    return View.create(new_shape, new_strides_tuple, offset, new_mask_tuple), False
 
-  new_view = View(new_shape, strides_for_shape(new_shape))
+  new_view = View.create(new_shape, strides_for_shape(new_shape))
   if view.contiguous: return new_view, False # NOTE: if it's contiguous it can't have an offset
   if (merged_view := merge_views(view, new_view)) is not None: return merged_view, False
   if DEBUG >= 4: print(f"WARNING: creating new view with reshape {view} -> {new_shape}")
@@ -205,32 +260,18 @@ class ShapeTracker:
   # *** under this line are the movement ops ***
 
   def __unsafe_resize(self, arg: Tuple[Tuple[int, int], ...], mask=None):
-    offset = get_unsafe_resize_offset(self.views[-1].strides, arg)
-    if self.views[-1].mask:
-      # move the old mask
-      nmask = tuple([(max(mx-ax, 0), min(my-ax, ay-ax)) for (mx,my),(ax,ay) in zip(self.views[-1].mask, arg)])
-      # merge the masks if we have two
-      mask = tuple([(max(mx1, mx2), min(my1, my2)) for (mx1, my1), (mx2, my2) in zip(nmask, mask)]) if mask is not None else nmask
-    self.views[-1] = View(tuple([y-x for x,y in arg]), self.views[-1].strides, self.views[-1].offset+offset, mask)
+    self.views[-1] = View.unsafe_resize(self.views[-1], arg, mask=mask)
 
   def pad(self, arg: Tuple[Tuple[int, int], ...]):
-    assert all((b>=0 and e>=0) for b,e in arg) and len(arg) == len(self.shape)
-    if any(b or e for b, e in arg):
-      zvarg, mask = get_pad_args(self.shape, arg)
-      self.__unsafe_resize(zvarg, mask=mask)
+    self.views[-1] = View.pad(self.views[-1], arg)
     return self
 
   def shrink(self, arg: Tuple[Tuple[int, int], ...]):
-    assert all((b>=0 and e<=s) for s,(b,e) in zip(self.shape,arg)) and len(arg) == len(self.shape)
-    self.__unsafe_resize(arg)
+    self.views[-1] = View.shrink(self.views[-1], arg)
     return self
 
   def expand(self, new_shape: Tuple[int, ...]) -> ShapeTracker:
-    assert len(new_shape) == len(self.views[-1].shape)
-    assert all(isinstance(x, int) and (s == x or (s == 1 and st == 0)) for s,x,st in zip(self.shape, new_shape, self.views[-1].strides)), f"can't expand {self.shape} into {new_shape}"
-    # NOTE: can the mask ever be (0,0)?
-    mask = tuple([(((0,0) if m != (0,1) else (0,ns)) if s != ns else m) for m,s,ns in zip(self.views[-1].mask, self.shape, new_shape)]) if self.views[-1].mask else None
-    self.views[-1] = View(new_shape, self.views[-1].strides, self.views[-1].offset, mask)
+    self.views[-1] = View.expand(self.views[-1], new_shape)
     return self
 
   def reshape(self, new_shape: Tuple[int, ...]):
@@ -245,19 +286,12 @@ class ShapeTracker:
     return self
 
   def permute(self, axis: Tuple[int, ...]):
-    assert all(isinstance(x, int) and x >= 0 and x < len(self.shape) for x in axis), f"invalid permute {axis} for {self.shape}"
-    assert len(set(axis)) == len(axis) and len(axis) == len(self.shape), f"can't permute {self.shape} with {axis}"
-    self.views[-1] = View(tuple([self.views[-1].shape[a] for a in axis]), tuple([self.views[-1].strides[a] for a in axis]), self.views[-1].offset, tuple([self.views[-1].mask[a] for a in axis]) if self.views[-1].mask is not None else None)
+    self.views[-1] = View.permute(self.views[-1], axis)
     return self
 
   # except for the negative case, you can build this from the others. invertible in the negative case
   def stride(self, mul: Tuple[int, ...]):
-    assert all(isinstance(x, int) and x != 0 for x in mul), f"invalid stride {mul} for {self.shape}"
-    strides = tuple([z*m for z,m in zip(self.views[-1].strides, mul)])
-    new_shape = tuple([(s+(abs(m)-1))//abs(m) for s,m in zip(self.views[-1].shape, mul)])
-    offset = sum([(s-1)*z for s,z,m in zip(self.views[-1].shape, self.views[-1].strides, mul) if m < 0])
-    mask = tuple([(((mx if m > 0 else s-my)+(abs(m)-1))//abs(m), ((my if m > 0 else s-mx)+(abs(m)-1))//abs(m)) for (mx,my),s,m in zip(self.views[-1].mask, self.views[-1].shape, mul)]) if self.views[-1].mask is not None else None
-    self.views[-1] = View(new_shape, strides, self.views[-1].offset + offset, mask)
+    self.views[-1] = View.stride(self.views[-1], mul)
     return self
 
   # *** entry point for external ***

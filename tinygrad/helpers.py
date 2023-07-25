@@ -35,21 +35,20 @@ class Context:
   def __enter__(self): ContextVar.ctx_stack.append({ **self.pvars, **{ key: ContextVar.ctx_stack[-1][key] for key in ContextVar.ctx_stack[-1].keys() if key not in self.pvars } })
   def __exit__(self, *args): ContextVar.ctx_stack.pop()
 
-class ContextVar:
+class ContextVar: # TODO: rewrite using ctx_stack on every access is quite expensive
+  __slots__ = ["key", "initial_value", "value"]
   ctx_stack: ClassVar[List[dict[str, Any]]] = [{}]
   def __init__(self, key, default_value):
     self.key, self.initial_value = key, getenv(key, default_value)
-    if key not in ContextVar.ctx_stack[-1]: ContextVar.ctx_stack[-1][key] = self.initial_value
-  def __call__(self, x): ContextVar.ctx_stack[-1][self.key] = x
+    self.value = self.initial_value
+  def __call__(self, x): self.value = x
   def __bool__(self): return self.value != 0
   def __ge__(self, x): return self.value >= x
   def __gt__(self, x): return self.value > x
   def __lt__(self, x): return self.value < x
-  @property
-  def value(self): return ContextVar.ctx_stack[-1][self.key] if self.key in ContextVar.ctx_stack[-1] else self.initial_value
 
-DEBUG, IMAGE = ContextVar("DEBUG", 0), ContextVar("IMAGE", 0)
-GRAPH, PRUNEGRAPH, GRAPHPATH = getenv("GRAPH", 0), getenv("PRUNEGRAPH", 0), getenv("GRAPHPATH", "/tmp/net")
+DEBUG, IMAGE, GRAPH = ContextVar("DEBUG", 0), ContextVar("IMAGE", 0), ContextVar("GRAPH", 0)
+PRUNEGRAPH, GRAPHPATH = getenv("PRUNEGRAPH", 0), getenv("GRAPHPATH", "/tmp/net")
 
 class Timing(object):
   def __init__(self, prefix="", on_exit=None, enabled=True): self.prefix, self.on_exit, self.enabled = prefix, on_exit, enabled
